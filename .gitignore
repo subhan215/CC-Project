@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual environments
+venv/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# Compiler output
+*.o
+*.s
+*.i
+*.exe
+*.out
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test outputs
+test_cases/*.exe
+test_cases/*.o
+test_cases/*.s

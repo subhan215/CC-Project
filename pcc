@@ -1,0 +1,581 @@
+#!/usr/bin/env python3
+"""
+Mini-C Compiler (PCC) - A C compiler for x86-64
+CS4031 - Compiler Construction | Fall 2025
+
+This compiler implements all six phases of compilation:
+1. Lexical Analysis - Tokenization
+2. Syntax Analysis - Parsing to AST
+3. Semantic Analysis - Type checking and symbol resolution
+4. Intermediate Code - TACKY IR generation
+5. Optimization - Constant folding, dead code elimination
+6. Code Generation - x86-64 assembly output
+"""
+
+import sys
+import subprocess
+import time
+import tempfile
+import os
+from pathlib import Path
+from typing import List
+
+from src.backend import *
+from src.backend.optimizer import optimize_program, OptimizationStats
+from src.frontend import *
+
+# Global flag for optimization
+OPTIMIZATION_ENABLED = True 
+
+def compile_file(input_files: List[str], output_file: str = None, stage: str = None, library_options: list = None):
+    """
+    Compiles one or more C source files through various compiler stages.
+
+    :param input_files: List of paths to input .c files
+    :param output_file: Where to write final executable (only used in 'run' stage)
+    :param stage: One of ['--lex', '--parse', '--tacky', '--codegen', '-S', 'run', '--help', '--validate', '-c'].
+    :param library_options: List of library options (e.g., ['-lm', '-lpthread'])
+    """
+    preprocessed_files = []  # To track all .i files created
+    object_files = []        # To track all .o files created
+    assembly_files = []      # To track all .s files created
+    library_options = library_options or []
+    
+    try:
+        input_paths = [Path(f) for f in input_files]
+        for path in input_paths:
+            if not path.exists():
+                print(f"Error: Input file {path} does not exist.", file=sys.stderr)
+                sys.exit(1)
+
+        if stage not in ['--lex', '--parse', '--tacky', '--optimize', '--codegen', '-S', 'run', '--help', '--validate', '-c']:
+            print(f"Error: Unknown stage '{stage}'", file=sys.stderr)
+            sys.exit(1)
+
+        # Handle single-file compilation stages
+        if stage in ['--lex', '--parse', '--tacky', '--optimize', '--codegen', '--validate']:
+            if len(input_paths) > 1:
+                print(f"Error: Stage '{stage}' only supports single file input", file=sys.stderr)
+                sys.exit(1)
+            
+            return compile_single_file_stages(input_paths[0], stage)
+
+        # For compilation stages that can handle multiple files
+        for input_path in input_paths:
+            # 1) Preprocess -> .i
+            preprocessed_file = input_path.with_suffix('.i')
+            preprocessed_files.append(preprocessed_file)
+            subprocess.run(
+                ['gcc', '-E', '-P', str(input_path), '-o', str(preprocessed_file)],
+                check=True
+            )
+
+            # Read the preprocessed code
+            with open(preprocessed_file, 'r') as file:
+                code = file.read()
+
+            # 2) Lex
+            tokens = lex(code)
+
+            # 3) Parse
+            ast = parse_program([token for _, token in tokens])
+
+            # 4) Variable Resolution Pass 
+            ast, symbols, type_table = variable_resolution_pass(ast)
+
+            # 5) Emit Tacky IR
+            tacky_ir, symbols1, type_table = emit_tacky(ast, symbols, type_table)
+
+            # 5.5) Optimization Pass
+            tacky_ir, opt_stats = optimize_program(tacky_ir, OPTIMIZATION_ENABLED)
+
+            # 6) Convert To Assembly AST
+            conv = Converter(symbols1, type_table)
+            a_ast, backend_symbol_table = conv.convert_to_assembly_ast(tacky_ir)
+            da = backend_symbol_table
+
+            # 7) Replace Pseudoregisters
+            [a_ast, stack_allocation, backend_symbol_table] = replace_pseudoregisters(a_ast, symbols, da)
+
+            # 8) Fixing Up Instructions
+            fix_up_instructions(a_ast, stack_allocation, backend_symbol_table)
+
+            # 9) Code Generation: Emit real .s assembly
+            output_s_path = input_path.with_suffix('.s').resolve()
+            assembly_files.append(output_s_path)
+            emitter = CodeEmitter(str(output_s_path), symbols, da)
+            emitter.emit_program(a_ast)
+            emitter.save()
+
+            if stage == '-S':
+                print('Assembly File creation stage:')
+                
+                continue 
+
+            # 10) Assemble -> produce object file (.o)
+            object_file = output_s_path.with_suffix('.o').resolve()
+            object_files.append(object_file)
+            subprocess.run(
+                ['gcc', '-c', str(output_s_path), '-o', str(object_file)],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+
+            if stage == '-c':
+                print('Object File creation stage:')
+                continue 
+                
+        if stage in ['-S']:
+            for i in assembly_files:
+                print("Assembly code written to ",i)
+            return  # We're done for these stages
+        if stage == '-c':
+            for i in object_files:
+                # print("Assembly code written to ",i)
+                print('Object files created at ',i)
+            return 
+        
+        # 11) Link -> produce final executable (only for 'run' stage)
+        if not output_file:
+            # Default to first input file's name without extension
+            exe_file = input_paths[0].with_suffix('').resolve()
+        else:
+            exe_file = Path(output_file).resolve()
+
+        # Construct the linking command with all object files and library options
+        linking_command = ['gcc'] + [str(o) for o in object_files] + ['-o', str(exe_file)] + library_options
+
+        subprocess.run(
+            linking_command,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        print(f"Compilation successful. Executable created at {exe_file}")
+
+        # 12) Clean up temporary files
+        for f in assembly_files + object_files:
+            if f.exists():
+                f.unlink()
+
+        print('File output:')
+        print(f"Executable: {exe_file}\n")
+
+    except subprocess.CalledProcessError as e:
+        print(f"Compilation or Linking error:\n{e.stderr}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"General error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        # Clean up all preprocessed files
+        for f in preprocessed_files:
+            if f.exists():
+                f.unlink()
+
+def compile_single_file_stages(input_path: Path, stage: str):
+    """Handle compilation stages that work on single files only."""
+    preprocessed_file = None
+    try:
+        # 1) Preprocess -> .i
+        preprocessed_file = input_path.with_suffix('.i')
+        subprocess.run(
+            ['gcc', '-E', '-P', str(input_path), '-o', str(preprocessed_file)],
+            check=True
+        )
+
+        # Read the preprocessed code
+        with open(preprocessed_file, 'r') as file:
+            code = file.read()
+
+        # 2) Lex
+        tokens = lex(code)
+        if stage == '--lex':
+            # Print tokens and exit
+            for token in tokens:
+                print(token)
+            return
+
+        # 3) Parse
+        ast = parse_program([token for _, token in tokens])
+        if stage == '--parse':
+            print("Parsed AST:")
+            print(ast)
+            return
+
+        # 4) Variable Resolution Pass 
+        ast, symbols, type_table = variable_resolution_pass(ast)
+        if stage == '--validate':
+            print(ast)
+            print('Symbols after validation:', symbols)
+            print(type_table)
+            return
+
+        # 5) Emit Tacky IR
+        tacky_ir, symbols1, type_table = emit_tacky(ast, symbols, type_table)
+        if stage == '--tacky':
+            print("Tacky IR (before optimization):")
+            print(tacky_ir)
+            print(symbols1)
+            print(type_table)
+            return
+
+        # 5.5) Optimization Pass
+        tacky_ir_optimized, opt_stats = optimize_program(tacky_ir, OPTIMIZATION_ENABLED)
+        if stage == '--optimize':
+            print("=" * 60)
+            print("OPTIMIZATION PHASE")
+            print("=" * 60)
+            print("\n--- Before Optimization ---")
+            print(tacky_ir)
+            print("\n--- After Optimization ---")
+            print(tacky_ir_optimized)
+            print("\n--- Optimization Statistics ---")
+            print(opt_stats)
+            return
+
+        tacky_ir = tacky_ir_optimized
+
+        # 6) Convert To Assembly AST
+        conv = Converter(symbols1, type_table)
+        a_ast, backend_symbol_table = conv.convert_to_assembly_ast(tacky_ir)
+        da = backend_symbol_table
+
+        # 7) Replace Pseudoregisters
+        [a_ast, stack_allocation, backend_symbol_table] = replace_pseudoregisters(a_ast, symbols, da)
+
+        # 8) Fixing Up Instructions
+        fix_up_instructions(a_ast, stack_allocation, backend_symbol_table)
+        
+        if stage == '--codegen':
+            print("Assembly AST:")
+            return
+
+    except subprocess.CalledProcessError as e:
+        print(f"Preprocessing error:\n{e.stderr}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"General error: {e}", file=sys.stderr)
+        sys.exit(1)
+    finally:
+        if preprocessed_file and preprocessed_file.exists():
+            preprocessed_file.unlink()
+
+def interactive_mode():
+    """
+    Interactive REPL mode for testing Mini-C code snippets.
+    Allows instructors to test code interactively.
+    """
+    print("=" * 60)
+    print("  Mini-C Compiler - Interactive Mode")
+    print("  CS4031 - Compiler Construction | Fall 2025")
+    print("=" * 60)
+    print("\nCommands:")
+    print("  :lex       - Show tokens for the input")
+    print("  :parse     - Show AST for the input")
+    print("  :validate  - Show semantic analysis results")
+    print("  :tacky     - Show intermediate representation")
+    print("  :compile   - Compile and run (default)")
+    print("  :help      - Show this help message")
+    print("  :quit      - Exit interactive mode")
+    print("\nEnter Mini-C code (end with a blank line or ':run'):")
+    print("-" * 60)
+
+    mode = ':compile'
+
+    while True:
+        try:
+            # Collect multi-line input
+            lines = []
+            prompt = ">>> " if not lines else "... "
+
+            while True:
+                try:
+                    line = input(prompt)
+                except EOFError:
+                    print("\nExiting interactive mode.")
+                    return
+
+                # Handle commands
+                if line.strip().startswith(':'):
+                    cmd = line.strip().lower()
+                    if cmd == ':quit' or cmd == ':exit' or cmd == ':q':
+                        print("Goodbye!")
+                        return
+                    elif cmd == ':help' or cmd == ':h':
+                        print("\nCommands: :lex, :parse, :validate, :tacky, :compile, :quit")
+                        print("Enter code, then blank line or :run to execute.\n")
+                        break
+                    elif cmd in [':lex', ':parse', ':validate', ':tacky', ':compile']:
+                        mode = cmd
+                        print(f"Mode set to {mode}")
+                        break
+                    elif cmd == ':run':
+                        break
+                    elif cmd == ':clear':
+                        lines = []
+                        print("Buffer cleared.")
+                        break
+                    else:
+                        print(f"Unknown command: {cmd}")
+                        break
+
+                # Blank line triggers execution
+                if line == '' and lines:
+                    break
+
+                lines.append(line)
+                prompt = "... "
+
+            if not lines:
+                continue
+
+            code = '\n'.join(lines)
+
+            # Process the code
+            process_interactive_input(code, mode)
+            print("-" * 60)
+
+        except KeyboardInterrupt:
+            print("\n\nInterrupted. Type :quit to exit.")
+        except Exception as e:
+            print(f"Error: {e}")
+            print("-" * 60)
+
+
+def process_interactive_input(code: str, mode: str):
+    """Process code input in interactive mode."""
+    try:
+        # Tokenize
+        tokens = lex(code)
+
+        if mode == ':lex':
+            print("\n--- Tokens ---")
+            for token in tokens:
+                print(f"  {token}")
+            return
+
+        # Parse
+        ast = parse_program([token for _, token in tokens])
+
+        if mode == ':parse':
+            print("\n--- Abstract Syntax Tree ---")
+            print(ast)
+            return
+
+        # Semantic analysis
+        ast, symbols, type_table = variable_resolution_pass(ast)
+
+        if mode == ':validate':
+            print("\n--- Semantic Analysis ---")
+            print("AST:", ast)
+            print("\nSymbol Table:", symbols)
+            print("\nType Table:", type_table)
+            return
+
+        # Generate IR
+        tacky_ir, symbols1, type_table = emit_tacky(ast, symbols, type_table)
+
+        if mode == ':tacky':
+            print("\n--- TACKY Intermediate Representation ---")
+            print(tacky_ir)
+            print("\nSymbols:", symbols1)
+            return
+
+        # Full compilation
+        if mode == ':compile':
+            # Create temporary file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.c', delete=False) as f:
+                f.write(code)
+                temp_c = f.name
+
+            try:
+                temp_path = Path(temp_c)
+
+                # Preprocess
+                temp_i = temp_path.with_suffix('.i')
+                subprocess.run(
+                    ['gcc', '-E', '-P', str(temp_path), '-o', str(temp_i)],
+                    check=True,
+                    capture_output=True
+                )
+
+                # Read preprocessed
+                with open(temp_i, 'r') as f:
+                    preprocessed = f.read()
+
+                # Full compilation pipeline
+                tokens = lex(preprocessed)
+                ast = parse_program([token for _, token in tokens])
+                ast, symbols, type_table = variable_resolution_pass(ast)
+                tacky_ir, symbols1, type_table = emit_tacky(ast, symbols, type_table)
+
+                conv = Converter(symbols1, type_table)
+                a_ast, backend_symbol_table = conv.convert_to_assembly_ast(tacky_ir)
+
+                [a_ast, stack_allocation, backend_symbol_table] = replace_pseudoregisters(
+                    a_ast, symbols, backend_symbol_table
+                )
+                fix_up_instructions(a_ast, stack_allocation, backend_symbol_table)
+
+                # Emit assembly
+                temp_s = temp_path.with_suffix('.s')
+                emitter = CodeEmitter(str(temp_s), symbols, backend_symbol_table)
+                emitter.emit_program(a_ast)
+                emitter.save()
+
+                # Compile and link
+                temp_exe = temp_path.with_suffix('')
+                subprocess.run(
+                    ['gcc', str(temp_s), '-o', str(temp_exe)],
+                    check=True,
+                    capture_output=True
+                )
+
+                # Run
+                print("\n--- Running Program ---")
+                result = subprocess.run(
+                    [str(temp_exe)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+                if result.stdout:
+                    print("Output:", result.stdout)
+                print(f"Return value: {result.returncode}")
+
+                # Cleanup
+                for f in [temp_i, temp_s, temp_exe]:
+                    if f.exists():
+                        f.unlink()
+
+            finally:
+                if os.path.exists(temp_c):
+                    os.unlink(temp_c)
+
+    except subprocess.CalledProcessError as e:
+        print(f"Compilation error: {e.stderr.decode() if e.stderr else e}")
+    except subprocess.TimeoutExpired:
+        print("Execution timed out (5 second limit)")
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+def usage():
+    """
+    Displays usage information for the compiler.
+    """
+    print("=" * 60)
+    print("  Mini-C Compiler (PCC) - x86-64 C Compiler")
+    print("  CS4031 - Compiler Construction | Fall 2025")
+    print("=" * 60)
+    print("\nUsage: python pcc [stage] <input_files...> [-o output] [options]\n")
+    print("Compilation Stages (Six Phases):")
+    print("  --lex       Phase 1: Lexical Analysis - print token stream")
+    print("  --parse     Phase 2: Syntax Analysis - print Abstract Syntax Tree")
+    print("  --validate  Phase 3: Semantic Analysis - print symbol table")
+    print("  --tacky     Phase 4: IR Generation - print TACKY intermediate code")
+    print("  --optimize  Phase 5: Optimization - show before/after optimization")
+    print("  --codegen   Phase 6: Code Generation - generate assembly AST")
+    print("  -S          Emit .s assembly files")
+    print("  -c          Emit .o object files")
+    print("  run         Full compilation to executable (default)")
+    print()
+    print("Interactive Mode:")
+    print("  --interactive, -i    Start interactive REPL mode")
+    print()
+    print("Options:")
+    print("  -o <file>   Specify output file name")
+    print("  -l<lib>     Link with library (e.g., -lm)")
+    print("  --help      Show this help message")
+    print()
+    print("Examples:")
+    print("  python pcc --lex program.c          # Show tokens")
+    print("  python pcc --parse program.c        # Show AST")
+    print("  python pcc --tacky program.c        # Show IR")
+    print("  python pcc -S program.c             # Generate assembly")
+    print("  python pcc run program.c -o prog    # Full compile")
+    print("  python pcc -i                       # Interactive mode")
+    print()
+    sys.exit(0)
+
+def main():
+    """
+    The main entry point for the compiler driver.
+    Parses command-line arguments and invokes the compilation process.
+    """
+    # Handle help
+    if '--help' in sys.argv or '-h' in sys.argv:
+        usage()
+
+    # Handle interactive mode
+    if '--interactive' in sys.argv or '-i' in sys.argv:
+        interactive_mode()
+        return
+
+    # Handle no arguments
+    if len(sys.argv) < 2:
+        usage()
+
+    start_time = time.time()
+
+    possible_stages = ['--lex', '--parse', '--tacky', '--optimize', '--codegen', '-S', 'run', '--validate', '-c']
+    stage = None
+    filenames = []
+    library_options = []
+
+    # Collect stage (if any), filenames, and library options
+    for arg in sys.argv[1:]:
+        if arg in possible_stages:
+            stage = arg
+        elif arg.startswith('-l') and len(arg) > 2:
+            library_options.append(arg)
+        elif arg == '-o' and len(sys.argv) > sys.argv.index(arg) + 1:
+            # Skip the -o and its argument here, we'll handle it later
+            continue
+        elif arg in ['--interactive', '-i', '--help', '-h']:
+            continue  # Already handled
+        elif arg.startswith('-'):
+            pass  # Ignore other flags for now
+        else:
+            filenames.append(arg)
+
+    # Handle -o output file specification
+    output_file = None
+    if '-o' in sys.argv and len(sys.argv) > sys.argv.index('-o') + 1:
+        output_file = sys.argv[sys.argv.index('-o') + 1]
+        # Remove it from filenames if it got added there
+        if output_file in filenames:
+            filenames.remove(output_file)
+
+    # If no stage given, default to 'run'
+    if stage is None:
+        stage = 'run'
+
+    if not filenames:
+        usage()  # No input file provided
+
+    # Check for .c files (add .c extension if needed)
+    input_files = []
+    for f in filenames:
+        path = Path(f)
+        if not path.exists() and not f.endswith('.c'):
+            candidate = path.with_suffix('.c')
+            if candidate.exists():
+                input_files.append(str(candidate))
+            else:
+                print(f"Error: Input file {f} does not exist.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            input_files.append(f)
+
+    compile_file(input_files, output_file=output_file, stage=stage, library_options=library_options)
+
+    end_time = time.time()
+    print(f"Execution Time: {end_time - start_time:.6f} seconds") 
+
+if __name__ == "__main__":
+    main()
+
